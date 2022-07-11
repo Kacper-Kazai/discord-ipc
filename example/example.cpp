@@ -42,8 +42,7 @@ std::string get_access_token(std::string client_id, std::string client_secret, s
     json response_json = json::parse(response);
     if (!response_json.contains("access_token")) return "";
 
-    response_json.at("access_token").get_to(response);
-    return response;
+    return response_json["access_token"];
 }
 
 int main(int argc, char* argv[]) {
@@ -66,50 +65,49 @@ int main(int argc, char* argv[]) {
         return 0;
     }
 
-    ipc_connection* connection = ipc_connection::create(client_id.c_str());
+    ipc_connection* connection = new ipc_connection(client_id);
 
     std::function<void(std::string&)> authenticate = [connection](std::string& event_data) {
-        json data_json = json::parse(event_data);
-
-        packet get_guilds_packet = packets::get_guilds();
-        connection->send(get_guilds_packet, [](std::string& event_data) {
-            json data_json = json::parse(event_data);
-            printf("%s\n", data_json.dump(2).c_str());
+        connection->send(packets::get_guilds(), [connection](std::string& event_data) {
+            json packet_json = json::parse(event_data);
+            printf("%s\n", packet_json["data"]["guilds"].dump(2).c_str());
+            connection->stop();
         });
     };
 
-    std::function<void(std::string&)> authorization = [client_id, client_secret, connection, authenticate](std::string& event_data) {
-        json data_json = json::parse(event_data);
+    std::function<void(std::string&)> authorization = [client_secret, connection, authenticate](std::string& event_data) {
+        json packet_json = json::parse(event_data);
+        json data_json = packet_json["data"];
 
-        if (!data_json.contains("code") || !data_json.at("code").is_string()) return;
-        std::string code{};
-        data_json.at("code").get_to(code);
-
-        std::string token = get_access_token(client_id, client_secret, code);
-        if (token.empty()) {
-            printf("Token exchange failed.\n");
+        if (!data_json.contains("code") || !data_json.at("code").is_string()) {
+            connection->stop();
             return;
         }
+        std::string code = data_json["code"];
 
-        packet authenticate_packet = packets::authenticate(token);
-        connection->send(authenticate_packet, authenticate);
+        std::string token = get_access_token(connection->get_application_id(), client_secret, code);
+        if (token.empty()) {
+            printf("Token exchange failed.\n");
+            connection->stop();
+            return;
+        }
+        connection->send(packets::authenticate(token), authenticate);
     };
 
-    connection->on("READY", [client_id, connection, authorization](std::string& event_data) {
-        json data_json = json::parse(event_data);
+    connection->on(events::ready, [connection, authorization](std::string& event_data) {
+        json packet_json = json::parse(event_data);
+        json data_json = packet_json["data"];
 
-        std::string username{};
-        data_json.at("user").at("username").get_to(username);
+        std::string username = data_json["user"]["username"];
         printf("Welcome %s!\n", username.c_str());
 
         scopes scopes;
         scopes.add(scopes::rpc);
-        packet authorize_packet = packets::authorize(client_id.c_str(), scopes);
-        connection->send(authorize_packet, authorization);
+        connection->send(packets::authorize(connection->get_application_id(), scopes), authorization);
     });
 
-    while (true) {
-        connection->loop();
-    }
+    connection->start();
+    connection->join();
+
     return 0;
 }

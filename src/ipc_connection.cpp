@@ -2,74 +2,77 @@
 #include "discord-ipc/serialization.h"
 #include <nlohmann/json.hpp>
 
+static const int ipc_version = 1;
+
 using discord_ipc::events;
+using discord_ipc::commands;
 using discord_ipc::packets;
 
-static const int ipc_version = 1;
-static ipc_connection instance;
-
-ipc_connection* ipc_connection::create(const char* application_id) {
-    instance.pipe = base_pipe::create();
-    memcpy(instance.application_id, application_id, 64);
-    instance.on(events::ready, [](std::string& event) {
-        instance.state = state::connected;
-    });
-    return &instance;
+ipc_connection::ipc_connection(std::string application_id) {
+    this->pipe = new base_pipe();
+    this->application_id = application_id;
 }
-void ipc_connection::destroy(ipc_connection*& connection) {
-    connection->close();
-    base_pipe::destroy(connection->pipe);
-    connection = nullptr;
+ipc_connection::~ipc_connection() {
+    this->close();
+    delete this->pipe;
 }
 
-void ipc_connection::loop() {
-    if (!is_open()) {
-        open();
-        return;
-    }
-    for (;;) {
-        std::string read_message;
-
-        if (!this->read(read_message)) break;
-
-        nlohmann::json message = nlohmann::json::parse(read_message);
-
-        std::string nonce{};
-        if (message.contains("nonce") && !message.at("nonce").is_null())
-            message.at("nonce").get_to(nonce);
-        nlohmann::json data{};
-        if (message.contains("data") && !message.at("data").is_null())
-            message.at("data").get_to(data);
-
-        if (!nonce.empty()) {
-            this->response_emitter.emit(nonce, data.dump());
-            this->response_emitter.remove(nonce);
-            continue;
+void ipc_connection::start() {
+    this->thread = std::thread([&]() {
+        while (this->keep_running) {
+            this->loop();
         }
-
-        std::string event_name = "ERROR";
-        if (message.contains("evt") && !message.at("evt").is_null())
-            message.at("evt").get_to(event_name);
-
-        this->emit(event_name, data.dump());
+    });
+}
+void ipc_connection::stop() {
+    this->keep_running = false;
+}
+void ipc_connection::join() {
+    if (this->thread.joinable()) {
+        this->thread.join();
     }
 }
 
 void ipc_connection::open() {
     if (!this->pipe->is_open && !this->pipe->open()) return;
 
-    packet send_packet = packets::handshake(ipc_version, application_id);
-
-    if (!this->send(send_packet)) {
-        close();
+    packet handshake_packet = packets::handshake(ipc_version, application_id);
+    if (!this->send(handshake_packet)) {
+        this->close();
         return;
     }
-    state = state::handshake;
+
+    this->on(events::ready, [&](std::string& event) {
+        this->state = state::connected;
+    });
+    this->state = state::handshake;
+}
+void ipc_connection::close() {
+    this->pipe->close();
+    this->state = state::disconnected;
 }
 
-void ipc_connection::close() {
-    pipe->close();
-    state = state::disconnected;
+void ipc_connection::loop() {
+    if (!this->is_open()) {
+        this->open();
+        return;
+    }
+    for (;;) {
+        std::string read_message;
+        if (!this->read(read_message)) break;
+
+        nlohmann::json packet = nlohmann::json::parse(read_message);
+
+        std::string cmd = packet["cmd"];
+        if (cmd != commands::dispatch) {
+            std::string nonce = packet["nonce"];
+            this->response_emitter.emit(nonce, packet.dump());
+            this->response_emitter.remove(nonce);
+        } else {
+            std::string evt = packet["evt"];
+            this->emit(evt, packet.dump());
+        }
+    }
 }
 
 bool ipc_connection::send(packet& packet) {
@@ -87,19 +90,20 @@ bool ipc_connection::send(packet& packet) {
 
     memcpy(data, packet.data.c_str(), sizeof(char) * length);
 
-    if (!pipe->write(data_pointer, packet_size)) {
+    if (!this->pipe->write(data_pointer, packet_size)) {
         close();
         return false;
     }
     return true;
 }
 bool ipc_connection::send(packet& send_packet, std::function<void(std::string&)> response) {
-    auto nonce = this->response_emitter.on(response);
+    std::string nonce = this->response_emitter.on(response);
 
     write_nonce_to_packet(send_packet, nonce);
 
-    return send(send_packet);
+    return this->send(send_packet);
 }
+
 
 bool ipc_connection::read(std::string& message) {
     struct packet_header {
@@ -109,10 +113,10 @@ bool ipc_connection::read(std::string& message) {
     packet_header packet_header;
 
     for (;;) {
-        bool did_read = pipe->read(&packet_header, sizeof(packet_header));
+        bool did_read = this->pipe->read(&packet_header, sizeof(packet_header));
         if (!did_read) {
-            if (!pipe->is_open) {
-                auto error_data = write_json_error((int)error_code::pipe_closed, "Pipe closed");
+            if (!this->pipe->is_open) {
+                std::string error_data = write_json_error((int)error_code::pipe_closed, "Pipe closed");
                 this->emit(events::error, error_data);
                 close();
             }
@@ -120,11 +124,11 @@ bool ipc_connection::read(std::string& message) {
         }
         if (packet_header.length > 0) {
             char* buffer = (char*)malloc(sizeof(char) * packet_header.length);
-            did_read = pipe->read(buffer, packet_header.length);
+            did_read = this->pipe->read(buffer, packet_header.length);
             if (!did_read) {
-                auto error_data = write_json_error((int)error_code::read_corrupt, "Partial data in frame");
+                std::string error_data = write_json_error((int)error_code::read_corrupt, "Partial data in frame");
                 this->emit(events::error, error_data);
-                close();
+                this->close();
                 return false;
             }
             message = buffer;
@@ -133,27 +137,22 @@ bool ipc_connection::read(std::string& message) {
 
         switch (packet_header.opcode) {
         case opcode::close: {
-            nlohmann::json data_json;
+            nlohmann::json packet_json = nlohmann::json::parse(message);
 
-            if (!data_json.contains("data")) {
-                close();
+            if (!packet_json.contains("code")) {
+                this->close();
                 return false;
             }
-            nlohmann::json error_data_json;
-            data_json.at("data").get_to(error_data_json);
+            int error_code = packet_json["code"];
 
-            int error_code{};
-            if (error_data_json.contains("code")) {
-                error_data_json.at("code").get_to(error_code);
-            }
             std::string error_message{};
-            if (error_data_json.contains("message")) {
-                error_data_json.at("message").get_to(error_message);
+            if (packet_json.contains("message")) {
+                error_message = packet_json["message"];
             }
 
             std::string error_data = write_json_error(error_code, error_message);
             this->emit(events::error, error_data);
-            close();
+            this->close();
             return false;
         }
         case opcode::frame: {
@@ -169,13 +168,14 @@ bool ipc_connection::read(std::string& message) {
             break;
         }
         case opcode::pong: {
+            printf("pong\n");
             break;
         }
         case opcode::handshake:
         default:
-            auto error_data = write_json_error((int)error_code::read_corrupt, "Bad ipc frame");
+            std::string error_data = write_json_error((int)error_code::read_corrupt, "Bad ipc frame");
             this->emit(events::error, error_data);
-            close();
+            this->close();
             return false;
         }
     }

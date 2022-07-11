@@ -4,44 +4,41 @@
 #include <windows.h>
 #include <assert.h>
 
-struct windows_pipe : public base_pipe {
+struct windows_pipe_data {
     HANDLE pipe{ INVALID_HANDLE_VALUE };
 };
 
-static windows_pipe connection;
-
-base_pipe* base_pipe::create(){
-    return &connection;
+base_pipe::base_pipe() {
+    windows_pipe_data windows_data;
+    this->data = &windows_data;
+}
+base_pipe::~base_pipe() {
+    this->close();
 }
 
-void base_pipe::destroy(base_pipe*& pipe){
-    auto self = reinterpret_cast<windows_pipe*>(pipe);
-    self->close();
-    pipe = nullptr;
-}
+bool base_pipe::open() {
+    wchar_t pipe_name[]{ L"\\\\?\\pipe\\discord-ipc-0" };
+    const size_t pipe_digit = sizeof(pipe_name) / sizeof(wchar_t) - 2;
+    pipe_name[pipe_digit] = L'0';
 
-bool base_pipe::open(){
-    wchar_t pipeName[]{ L"\\\\?\\pipe\\discord-ipc-0" };
-    const size_t pipeDigit = sizeof(pipeName) / sizeof(wchar_t) - 2;
-    pipeName[pipeDigit] = L'0';
-    auto self = reinterpret_cast<windows_pipe*>(this);
+    auto windows_data = (windows_pipe_data*)this->data;
+
     for (;;) {
-        self->pipe = ::CreateFileW(
-            pipeName, GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);
-        if (self->pipe != INVALID_HANDLE_VALUE) {
-            self->is_open = true;
+        windows_data->pipe = ::CreateFileW(
+            pipe_name, GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);
+        if (windows_data->pipe != INVALID_HANDLE_VALUE) {
+            this->is_open = true;
             return true;
         }
-
-        auto lastError = GetLastError();
-        if (lastError == ERROR_FILE_NOT_FOUND) {
-            if (pipeName[pipeDigit] < L'9') {
-                pipeName[pipeDigit]++;
+        auto last_error = GetLastError();
+        if (last_error == ERROR_FILE_NOT_FOUND) {
+            if (pipe_name[pipe_digit] < L'9') {
+                pipe_name[pipe_digit]++;
                 continue;
             }
         }
-        else if (lastError == ERROR_PIPE_BUSY) {
-            if (!WaitNamedPipeW(pipeName, 10000)) {
+        else if (last_error == ERROR_PIPE_BUSY) {
+            if (!WaitNamedPipeW(pipe_name, 1000)) {
                 return false;
             }
             continue;
@@ -50,67 +47,64 @@ bool base_pipe::open(){
     }
 }
 
-bool base_pipe::close(){
-    auto self = reinterpret_cast<windows_pipe*>(this);
-    ::CloseHandle(self->pipe);
-    self->pipe = INVALID_HANDLE_VALUE;
-    self->is_open = false;
+bool base_pipe::close() {
+    auto windows_data = (windows_pipe_data*)this->data;
+    ::CloseHandle(windows_data->pipe);
+    windows_data->pipe = INVALID_HANDLE_VALUE;
+    this->is_open = false;
     return true;
 }
 
-bool base_pipe::write(const void* data, size_t length)
-{
+bool base_pipe::write(const void* data, size_t length) {
     if (length == 0) {
         return true;
     }
-    auto self = reinterpret_cast<windows_pipe*>(this);
-    assert(self);
-    if (!self) {
-        return false;
-    }
-    if (self->pipe == INVALID_HANDLE_VALUE) {
-        return false;
-    }
-    assert(data);
-    if (!data) {
-        return false;
-    }
-    const DWORD bytesLength = (DWORD)length;
-    DWORD bytesWritten = 0;
-    return ::WriteFile(self->pipe, data, bytesLength, &bytesWritten, nullptr) == TRUE &&
-        bytesWritten == bytesLength;
-}
+    auto windows_data = (windows_pipe_data*)this->data;
 
-bool base_pipe::read(void* data, size_t length)
-{
+    assert(windows_data);
+    if (!windows_data) {
+        return false;
+    }
+    if (windows_data->pipe == INVALID_HANDLE_VALUE) {
+        return false;
+    }
     assert(data);
     if (!data) {
         return false;
     }
-    auto self = reinterpret_cast<windows_pipe*>(this);
-    assert(self);
-    if (!self) {
+    const DWORD bytes_length = (DWORD)length;
+    DWORD bytes_written = 0;
+    return ::WriteFile(windows_data->pipe, data, bytes_length, &bytes_written, nullptr) == TRUE && bytes_written == bytes_length;
+}
+bool base_pipe::read(void* data, size_t length) {
+    assert(data);
+    if (!data) {
         return false;
     }
-    if (self->pipe == INVALID_HANDLE_VALUE) {
+    auto windows_data = (windows_pipe_data*)this->data;
+    assert(windows_data);
+    if (!windows_data) {
         return false;
     }
-    DWORD bytesAvailable = 0;
-    if (::PeekNamedPipe(self->pipe, nullptr, 0, nullptr, &bytesAvailable, nullptr)) {
-        if (bytesAvailable >= length) {
-            DWORD bytesToRead = (DWORD)length;
-            DWORD bytesRead = 0;
-            if (::ReadFile(self->pipe, data, bytesToRead, &bytesRead, nullptr) == TRUE) {
-                assert(bytesToRead == bytesRead);
+    if (windows_data->pipe == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+    DWORD bytes_available = 0;
+    if (::PeekNamedPipe(windows_data->pipe, nullptr, 0, nullptr, &bytes_available, nullptr)) {
+        if (bytes_available >= length) {
+            DWORD bytes_to_read = (DWORD)length;
+            DWORD bytes_read = 0;
+            if (::ReadFile(windows_data->pipe, data, bytes_to_read, &bytes_read, nullptr) == TRUE) {
+                assert(bytes_to_read == bytes_read);
                 return true;
             }
             else {
-                close();
+                this->close();
             }
         }
     }
     else {
-        close();
+        this->close();
     }
     return false;
 }

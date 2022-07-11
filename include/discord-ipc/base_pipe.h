@@ -3,8 +3,9 @@
 #include <stdlib.h>
 
 struct base_pipe {
-    static base_pipe* create();
-    static void destroy(base_pipe*&);
+    base_pipe();
+    ~base_pipe();
+    void* data;
     bool is_open{ false };
     bool open();
     bool close();
