@@ -1,8 +1,12 @@
 #include "discord-ipc/ipc_connection.h"
 #include "discord-ipc/serialization.h"
-#include <nlohmann/json.hpp>
 
+#include <nlohmann/json.hpp>
 #include <curl/curl.h>
+
+using discord_ipc::events;
+using discord_ipc::packets;
+using discord_ipc::types::scopes;
 
 using nlohmann::json;
 
@@ -67,7 +71,7 @@ int main(int argc, char* argv[]) {
     std::function<void(std::string&)> authenticate = [connection](std::string& event_data) {
         json data_json = json::parse(event_data);
 
-        packet get_guilds_packet = create_command_packet("GET_GUILDS", "");
+        packet get_guilds_packet = packets::get_guilds();
         connection->send(get_guilds_packet, [](std::string& event_data) {
             json data_json = json::parse(event_data);
             printf("%s\n", data_json.dump(2).c_str());
@@ -87,8 +91,8 @@ int main(int argc, char* argv[]) {
             return;
         }
 
-        packet send_packet = create_authenticate_packet(token);
-        connection->send(send_packet, authenticate);
+        packet authenticate_packet = packets::authenticate(token);
+        connection->send(authenticate_packet, authenticate);
     };
 
     connection->on("READY", [client_id, connection, authorization](std::string& event_data) {
@@ -98,10 +102,11 @@ int main(int argc, char* argv[]) {
         data_json.at("user").at("username").get_to(username);
         printf("Welcome %s!\n", username.c_str());
 
-        std::vector<std::string> scopes = { "rpc" };
-        packet send_packet = create_authorize_packet(client_id.c_str(), scopes);
-        connection->send(send_packet, authorization);
-        });
+        scopes scopes;
+        scopes.add(scopes::rpc);
+        packet authorize_packet = packets::authorize(client_id.c_str(), scopes);
+        connection->send(authorize_packet, authorization);
+    });
 
     while (true) {
         connection->loop();
